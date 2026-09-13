@@ -1,0 +1,11 @@
+*.env
+.env
+.env.*
+!*.env.example
+state.json
+*.state.json
+remnawave-profile.json
+__pycache__/
+.venv/
+venv/
+*.log
