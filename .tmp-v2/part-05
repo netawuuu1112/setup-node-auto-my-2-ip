@@ -1,0 +1,132 @@
+  fi
+  firewall_add_only
+  create_node_panel
+  create_hosts_panel
+  additive_squads
+  switch_existing_node_last
+  sleep 3
+  local pc=0; postcheck || pc=$?
+  if ((pc==0)); then
+    enable_created_hosts || pc=3
+  fi
+  if ((pc!=0)) && [[ "$NODE_ACTION" == reuse && "$NODE_SWITCHED" == 1 && -n "${OLD_PROFILE_UUID:-}" ]]; then
+    warn "Новая конфигурация не прошла финальную проверку — автоматически возвращаю существующую Node на прежний profile binding (объекты не удаляются)."
+    rollback_node_binding || warn "Автоматический rollback binding не удался; используй пункт меню rollback."
+    NODE_SWITCHED=0
+  fi
+  save_state; write_txn "$([[ $pc -eq 0 ]] && echo success || echo warning)"
+  echo
+  if ((pc==0)); then ok "ГОТОВО: Node настроена, effective config подтверждён, Hosts активированы"; else warn "Созданные новые объекты сохранены для аудита, но существующая Node возвращена на старый profile при возможности. DELETE не выполнялся."; fi
+  echo "Profile UUID: $PROFILE_UUID"
+  echo "Node UUID:    $NODE_UUID"
+  (has_tcp || has_xhttp) && echo "PublicKey:    $PUBLIC_KEY"
+  has_tcp && echo "TCP ShortID:  $SID_TCP"
+  has_xhttp && echo "XHTTP ShortID:$SID_XHTTP"
+  has_xhttp && echo "XHTTP path:   $XHTTP_PATH"
+  echo "Snapshot:     $SNAPSHOT_DIR"
+  echo "State:        $STATE"
+}
+
+doctor_readonly(){
+  banner; need_root; install_base_packages; load_settings
+  echo "=== Docker ==="; docker ps --filter name="$CONTAINER" || true
+  echo; echo "=== Ports ==="; ss -lntup | grep -E ':(443|8443|2222)\b' || true
+  echo; echo "=== rw-core ==="; docker exec "$CONTAINER" rw-core version | head -n1 || true
+  echo; echo "=== Effective inbounds ==="
+  docker exec "$CONTAINER" cli --dump-config-raw 2>/dev/null | jq '[.inbounds[]|{tag,protocol,port,listen,network:.streamSettings.network,security:.streamSettings.security,flow:.settings.flow,dest:.streamSettings.realitySettings.dest,xhttpPath:.streamSettings.xhttpSettings.path}]' || true
+  echo; [[ -s "$STATE" ]] && { echo "=== Managed state ==="; jq '{version,domain,transportMode,profileUuid,nodeUuid,previousProfileUuid,createdAt}' "$STATE"; }
+}
+
+panel_audit(){
+  banner; need_root; install_base_packages; load_settings; panel_auth; panel_discover
+  echo "Profiles: $(profiles_arr | jq 'length')"
+  echo "Hosts:    $(hosts_arr | jq 'length')"
+  echo "Nodes:    $(nodes_arr | jq 'length')"
+  echo "Squads:   $(squads_arr | jq 'length')"
+  echo; echo "Nodes:"
+  nodes_arr | jq -r '.[]|"- \(.name) | \(.address):\(.port) | \(.uuid) | profile=\(.configProfile.activeConfigProfileUuid // "-")"'
+}
+
+rollback_menu(){
+  banner; need_root; install_base_packages; load_settings
+  [[ -s "$STATE" ]] || die "Нет state предыдущей установки"
+  PANEL_URL="$(jq -r '.panel' "$STATE")"; DOMAIN="$(jq -r '.domain' "$STATE")"; panel_auth
+  NODE_UUID="$(jq -r '.nodeUuid' "$STATE")"; OLD_PROFILE_UUID="$(jq -r '.previousProfileUuid // empty' "$STATE")"; OLD_INBOUNDS="$(jq -c '.previousActiveInbounds // []' "$STATE")"
+  [[ -n "$OLD_PROFILE_UUID" ]] || die "Эта Node была создана с нуля; предыдущего binding нет"
+  echo "Будет восстановлен ТОЛЬКО предыдущий profile binding Node $NODE_UUID -> $OLD_PROFILE_UUID. Ничего не удаляется."
+  local q; read -r -p "Введите ВЕРНУТЬ: " q; [[ "$q" == "ВЕРНУТЬ" ]] || return 0
+  rollback_node_binding
+}
+
+settings_menu(){
+  load_settings
+  while true; do
+    banner
+    echo "1) Panel URL:       ${PANEL_URL:-не задан}"
+    echo "2) Node domain:     ${DOMAIN:-не задан}"
+    echo "3) Reality target:  $REALITY_TARGET"
+    echo "4) Default scheme:  $TRANSPORT_MODE ($(mode_desc "$TRANSPORT_MODE" 2>/dev/null || echo '?'))"
+    echo "0) Назад"
+    local n; read -r -p "Выбор: " n
+    case "$n" in
+      1) read -r -p "Panel URL: " PANEL_URL; normalize_panel_url "$PANEL_URL";;
+      2) read -r -p "Node domain: " DOMAIN;;
+      3) read -r -p "Reality target: " REALITY_TARGET;;
+      4) choose_transport;;
+      0) save_settings; return 0;;
+    esac
+    save_settings
+  done
+}
+
+selftest(){
+  local oldd="$DOMAIN" oldm="$TRANSPORT_MODE" oldt="$REALITY_TARGET"
+  DOMAIN="node.example.com"; REALITY_TARGET="ads.x5.ru"; TRANSPORT_MODE=7; make_names
+  [[ "$PROFILE_NAME" == KOSMO-NODE-M7-* ]] || return 1
+  [[ "$(xhttp_port)" == 8443 ]] || return 1
+  TRANSPORT_MODE=6; [[ "$(xhttp_port)" == 443 ]] || return 1
+  DOMAIN="$oldd"; TRANSPORT_MODE="$oldm"; REALITY_TARGET="$oldt"; ok "Self-test OK"
+}
+
+ci_build(){
+  local m="$1" out="$2"
+  DOMAIN="node.example.com"; REALITY_TARGET="ads.x5.ru"; TRANSPORT_MODE="$m"; PROFILE_DIR="$(dirname "$out")"; mkdir -p "$PROFILE_DIR"
+  HYSTERIA_CERT="/opt/hysteria/certs/fullchain.pem"; HYSTERIA_KEY="/opt/hysteria/certs/privkey.pem"; make_names
+  PRIVATE_KEY="${CI_PRIVATE_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}"; PUBLIC_KEY="${CI_PUBLIC_KEY:-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB}"; SID_TCP=0123456789abcdef; SID_XHTTP=fedcba9876543210
+  build_profile; cp "$PROFILE_FILE" "$out"; jq . "$out" >/dev/null
+}
+
+main_menu(){
+  need_root; init_dirs; load_settings
+  while true; do
+    banner
+    echo "1) Установить/настроить Node полностью (новый сервер ИЛИ поверх существующей)"
+    echo "2) Диагностика Node — только чтение"
+    echo "3) Аудит панели — только чтение"
+    echo "4) Вернуть предыдущий профиль Node (без удаления объектов)"
+    echo "5) Настройки"
+    echo "6) Self-test скрипта"
+    echo "0) Выход"
+    echo
+    echo "Схемы: TCP Reality | Hysteria2 | TCP+H2 | XHTTP Reality | комбинации."
+    local n; read -r -p "Выбор: " n
+    case "$n" in
+      1) run_full_setup; pause;;
+      2) doctor_readonly; pause;;
+      3) panel_audit; pause;;
+      4) rollback_menu; pause;;
+      5) settings_menu;;
+      6) selftest; pause;;
+      0) exit 0;;
+      *) warn "Неверный пункт"; sleep 1;;
+    esac
+  done
+}
+
+case "${1:-}" in
+  --self-test) selftest;;
+  --doctor) init_dirs; doctor_readonly;;
+  --ci-build) [[ $# -eq 3 ]] || die "--ci-build MODE OUTPUT"; ci_build "$2" "$3";;
+  "") main_menu;;
+  *) echo "Usage: $0 [--self-test|--doctor|--ci-build MODE OUTPUT]"; exit 1;;
+esac
