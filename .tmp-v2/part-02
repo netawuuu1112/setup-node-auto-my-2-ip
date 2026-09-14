@@ -1,0 +1,170 @@
+  esac
+}
+has_tcp(){ [[ "$TRANSPORT_MODE" =~ ^(1|3|5|7)$ ]]; }
+has_h2(){ [[ "$TRANSPORT_MODE" =~ ^(2|3|6|7)$ ]]; }
+has_xhttp(){ [[ "$TRANSPORT_MODE" =~ ^(4|5|6|7)$ ]]; }
+xhttp_port(){ if has_tcp; then echo "$XHTTP_PORT_COMBO"; else echo 443; fi; }
+
+choose_transport(){
+  echo "Выбери рабочую схему:"
+  echo "  1) VLESS TCP Reality (проверенная базовая)"
+  echo "  2) Hysteria2"
+  echo "  3) TCP Reality + Hysteria2 (оба на 443: TCP+UDP) [рекомендуется]"
+  echo "  4) XHTTP + Reality"
+  echo "  5) TCP Reality + XHTTP Reality (XHTTP на 8443)"
+  echo "  6) Hysteria2 + XHTTP Reality (оба на 443: UDP+TCP)"
+  echo "  7) TCP Reality + Hysteria2 + XHTTP Reality (XHTTP 8443)"
+  local m; read -r -p "Выбор [$TRANSPORT_MODE]: " m; TRANSPORT_MODE="${m:-$TRANSPORT_MODE}"
+  mode_desc "$TRANSPORT_MODE" >/dev/null || die "Неверный режим"
+  ok "Схема: $(mode_desc "$TRANSPORT_MODE")"
+}
+
+ensure_hysteria_cert(){
+  has_h2 || return 0
+  mkdir -p "$(dirname "$HYSTERIA_CERT")"; chmod 700 "$(dirname "$HYSTERIA_CERT")"
+  if [[ -s "$HYSTERIA_CERT" && -s "$HYSTERIA_KEY" ]] && openssl x509 -in "$HYSTERIA_CERT" -noout -checkend 86400 >/dev/null 2>&1; then
+    ok "Hysteria TLS-сертификат уже есть и не истекает в ближайшие 24ч"; return 0
+  fi
+  local le="/etc/letsencrypt/live/$DOMAIN"
+  if [[ -s "$le/fullchain.pem" && -s "$le/privkey.pem" ]]; then
+    cp -L "$le/fullchain.pem" "$HYSTERIA_CERT"; cp -L "$le/privkey.pem" "$HYSTERIA_KEY"; chmod 600 "$HYSTERIA_CERT" "$HYSTERIA_KEY"; ok "Использован существующий Let's Encrypt сертификат"; return 0
+  fi
+  if ss -lnt '( sport = :80 )' | grep -q LISTEN; then
+    die "Для Hysteria2 нужен TLS-сертификат, а TCP/80 занят. Скрипт ничего не будет останавливать автоматически. Освободи 80 или установи сертификат в $HYSTERIA_CERT/$HYSTERIA_KEY."
+  fi
+  need_cmd certbot || { apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot >/dev/null; }
+  info "Получаю Let's Encrypt сертификат для $DOMAIN через standalone HTTP-01..."
+  certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$DOMAIN" || die "Let's Encrypt не выдал сертификат"
+  cp -L "$le/fullchain.pem" "$HYSTERIA_CERT"; cp -L "$le/privkey.pem" "$HYSTERIA_KEY"; chmod 600 "$HYSTERIA_CERT" "$HYSTERIA_KEY"
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  cat > /etc/letsencrypt/renewal-hooks/deploy/kosmo-remnanode-hysteria.sh <<HOOK
+#!/usr/bin/env bash
+set -e
+cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem $HYSTERIA_CERT
+cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem $HYSTERIA_KEY
+chmod 600 $HYSTERIA_CERT $HYSTERIA_KEY
+docker restart $CONTAINER >/dev/null 2>&1 || true
+HOOK
+  chmod 700 /etc/letsencrypt/renewal-hooks/deploy/kosmo-remnanode-hysteria.sh
+  ok "Hysteria TLS-сертификат установлен + renewal hook"
+}
+
+pull_node_image(){
+  if [[ "$INSTALL_MODE" == "new" ]]; then
+    docker pull "$REMNANODE_IMAGE" >/dev/null
+    local pinned
+    pinned="$(docker image inspect "$REMNANODE_IMAGE" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)"
+    if [[ -n "$pinned" && "$pinned" == *@sha256:* ]]; then
+      REMNANODE_IMAGE="$pinned"
+      ok "Образ RemnaNode загружен и зафиксирован по digest: ${pinned#*@}"
+    else
+      warn "Не удалось получить RepoDigest; используется $REMNANODE_IMAGE"
+    fi
+  fi
+}
+
+gen_reality_keys(){
+  if ! has_tcp && ! has_xhttp; then PRIVATE_KEY=""; PUBLIC_KEY=""; SID_TCP=""; SID_XHTTP=""; return 0; fi
+  local raw
+  if container_running; then raw="$(docker exec "$CONTAINER" rw-core x25519 2>&1)" || true
+  else raw="$(docker run --rm --entrypoint rw-core "$REMNANODE_IMAGE" x25519 2>&1)" || true; fi
+  PRIVATE_KEY="$(awk -F': ' 'tolower($1) ~ /privatekey|private key/ {print $2;exit}' <<<"$raw")"
+  PUBLIC_KEY="$(awk -F': ' 'tolower($1) ~ /password|publickey|public key/ {print $2;exit}' <<<"$raw")"
+  [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] || die "Не удалось получить пару X25519 из rw-core"
+  SID_TCP="$(openssl rand -hex 8)"; SID_XHTTP="$(openssl rand -hex 8)"
+  ok "Reality X25519 ключи сгенерированы"
+}
+
+make_names(){
+  local base suffix code
+  base="$(tr '[:lower:]' '[:upper:]' <<<"${DOMAIN%%.*}" | sed -E 's/[^A-Z0-9]+/-/g' | cut -c1-14)"; [[ -n "$base" ]] || base="NODE"
+  suffix="$(openssl rand -hex 2 | tr '[:lower:]' '[:upper:]')"
+  code="M$TRANSPORT_MODE"
+  PROFILE_NAME="KOSMO-${base}-${code}-${suffix}"
+  TCP_TAG="${base}-TCP-${suffix}"; H2_TAG="${base}-H2-${suffix}"; XHTTP_TAG="${base}-XH-${suffix}"
+  TCP_HOST="${base} TCP ${suffix}"; H2_HOST="${base} Hysteria ${suffix}"; XHTTP_HOST="${base} XHTTP ${suffix}"
+  NODE_DEFAULT_NAME="KOSMO-${base}"
+  XHTTP_PATH="/api/v1/$(openssl rand -hex 8)/"
+}
+
+build_profile(){
+  local inbounds='[]' p xp
+  if has_tcp; then
+    p="$(jq -n --arg tag "$TCP_TAG" --arg target "$REALITY_TARGET" --arg pk "$PRIVATE_KEY" --arg sid "$SID_TCP" '{tag:$tag,port:443,listen:"0.0.0.0",protocol:"vless",settings:{clients:[],decryption:"none"},sniffing:{enabled:true,routeOnly:true,destOverride:["http","tls","quic"]},streamSettings:{network:"tcp",sockopt:{mark:255,tcpNoDelay:true,tcpFastOpen:true},security:"reality",tcpSettings:{header:{type:"none"},acceptProxyProtocol:false},realitySettings:{dest:($target+":443"),show:false,xver:0,spiderX:"",shortIds:[$sid],privateKey:$pk,serverNames:[$target]}}}')"
+    inbounds="$(jq --argjson x "$p" '. + [$x]' <<<"$inbounds")"
+  fi
+  if has_h2; then
+    p="$(jq -n --arg tag "$H2_TAG" --arg cert "$HYSTERIA_CERT" --arg key "$HYSTERIA_KEY" '{tag:$tag,port:443,listen:"0.0.0.0",protocol:"hysteria",settings:{users:[],clients:[],version:2},streamSettings:{network:"hysteria",security:"tls",tlsSettings:{alpn:["h3"],certificates:[{keyFile:$key,certificateFile:$cert}]},hysteriaSettings:{version:2}}}')"
+    inbounds="$(jq --argjson x "$p" '. + [$x]' <<<"$inbounds")"
+  fi
+  if has_xhttp; then
+    xp="$(xhttp_port)"
+    p="$(jq -n --arg tag "$XHTTP_TAG" --arg target "$REALITY_TARGET" --arg pk "$PRIVATE_KEY" --arg sid "$SID_XHTTP" --arg path "$XHTTP_PATH" --argjson port "$xp" '{tag:$tag,port:$port,listen:"0.0.0.0",protocol:"vless",settings:{clients:[],decryption:"none"},sniffing:{enabled:true,routeOnly:true,destOverride:["http","tls","quic"]},streamSettings:{network:"xhttp",security:"reality",xhttpSettings:{host:$target,mode:"packet-up",path:$path},realitySettings:{dest:($target+":443"),show:false,xver:0,spiderX:"",shortIds:[$sid],privateKey:$pk,serverNames:[$target]}}}')"
+    inbounds="$(jq --argjson x "$p" '. + [$x]' <<<"$inbounds")"
+  fi
+  PROFILE_JSON="$(jq -n --argjson ib "$inbounds" '{log:{loglevel:"warning"},dns:{servers:["1.1.1.1","8.8.8.8"],queryStrategy:"UseIPv4"},inbounds:$ib,outbounds:[{tag:"DIRECT",protocol:"freedom",settings:{domainStrategy:"UseIPv4"}},{tag:"BLOCK",protocol:"blackhole"}],routing:{rules:[{type:"field",protocol:["bittorrent"],outboundTag:"BLOCK"}],domainStrategy:"IPIfNonMatch"}}')"
+  PROFILE_FILE="$PROFILE_DIR/${PROFILE_NAME}.json"
+  printf '%s\n' "$PROFILE_JSON" | jq . > "$PROFILE_FILE"; chmod 600 "$PROFILE_FILE"
+  ok "Профиль собран: $PROFILE_FILE"
+}
+
+validate_profile_shape(){
+  jq -e '.inbounds|length>0' "$PROFILE_FILE" >/dev/null || die "Пустой профиль"
+  if has_tcp; then jq -e --arg t "$TCP_TAG" '.inbounds[]|select(.tag==$t)|.streamSettings.network=="tcp" and .streamSettings.security=="reality" and (.settings|has("flow")|not)' "$PROFILE_FILE" >/dev/null || die "TCP Reality профиль не прошёл self-check"; fi
+  if has_h2; then jq -e --arg t "$H2_TAG" '.inbounds[]|select(.tag==$t)|.protocol=="hysteria" and .streamSettings.network=="hysteria"' "$PROFILE_FILE" >/dev/null || die "Hysteria профиль не прошёл self-check"; fi
+  if has_xhttp; then jq -e --arg t "$XHTTP_TAG" '.inbounds[]|select(.tag==$t)|.streamSettings.network=="xhttp" and .streamSettings.security=="reality" and .streamSettings.xhttpSettings.mode=="packet-up"' "$PROFILE_FILE" >/dev/null || die "XHTTP профиль не прошёл self-check"; fi
+  ok "Структура профиля проверена"
+}
+
+validate_profile_xray(){
+  local mounts=(-v "$PROFILE_FILE:/tmp/kosmo-profile.json:ro")
+  has_h2 && mounts+=(-v "/opt/hysteria/certs:/opt/hysteria/certs:ro")
+  local out rc=0
+  out="$(docker run --rm --entrypoint rw-core "${mounts[@]}" "$REMNANODE_IMAGE" run -test -c /tmp/kosmo-profile.json 2>&1)" || rc=$?
+  if ((rc!=0)); then
+    warn "rw-core -test не принял профиль. Вывод:"
+    echo "$out" >&2
+    die "Профиль не будет отправлен в панель"
+  fi
+  ok "Профиль принят реальным rw-core"
+}
+
+panel_discover(){
+  PROFILES_JSON="$(api_get config-profiles)"
+  HOSTS_JSON="$(api_get hosts)"
+  SQUADS_JSON="$(api_get internal-squads)"
+  NODES_JSON="$(api_get nodes)"
+  INBOUNDS_JSON="$(api_get config-profiles/inbounds)"
+}
+profiles_arr(){ jq -c '(.response//.)|(.configProfiles//[])' <<<"$PROFILES_JSON"; }
+hosts_arr(){ jq -c '(.response//.)|if type=="array" then . else (.hosts//[]) end' <<<"$HOSTS_JSON"; }
+squads_arr(){ jq -c '(.response//.)|(.internalSquads//[])' <<<"$SQUADS_JSON"; }
+nodes_arr(){ jq -c '(.response//.)|if type=="array" then . else (.nodes//[]) end' <<<"$NODES_JSON"; }
+inbounds_arr(){ jq -c '(.response//.)|if type=="array" then . else (.inbounds//[]) end' <<<"$INBOUNDS_JSON"; }
+
+collision_guard(){
+  profiles_arr | jq -e --arg n "$PROFILE_NAME" 'any(.[];.name==$n)' >/dev/null && die "Profile $PROFILE_NAME уже существует"
+  local h
+  for h in "$TCP_HOST" "$H2_HOST" "$XHTTP_HOST"; do
+    [[ -n "$h" ]] || continue
+    hosts_arr | jq -e --arg n "$h" 'any(.[];.remark==$n)' >/dev/null && die "Host '$h' уже существует"
+  done
+  ok "Коллизий с создаваемыми объектами нет"
+}
+
+snapshot_panel(){
+  local d="$BACKUPS/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  mkdir -p "$d"; chmod 700 "$d"
+  printf '%s\n' "$PROFILES_JSON" > "$d/profiles.json"
+  printf '%s\n' "$HOSTS_JSON" > "$d/hosts.json"
+  printf '%s\n' "$SQUADS_JSON" > "$d/squads.json"
+  printf '%s\n' "$NODES_JSON" > "$d/nodes.json"
+  printf '%s\n' "$INBOUNDS_JSON" > "$d/inbounds.json"
+  (cd "$d" && sha256sum *.json > SHA256SUMS)
+  SNAPSHOT_DIR="$d"; ok "Snapshot панели: $d"
+}
+
+backup_local(){
+  local d="$BACKUPS/local-$(date -u +%Y%m%dT%H%M%SZ)-$$"; mkdir -p "$d"; chmod 700 "$d"
+  local f
+  for f in "$COMPOSE_DIR/docker-compose.yml" "$COMPOSE_DIR/docker-compose.yaml" "$COMPOSE_DIR/compose.yml" "$COMPOSE_DIR/compose.yaml" "$COMPOSE_DIR/docker-compose.override.yml" "$COMPOSE_DIR/docker-compose.kosmo.yml"; do
