@@ -1,0 +1,196 @@
+name: Test V2 end-to-end installer
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'VERSION-2-WITH-PANEL/setup-node-panel.sh'
+      - '.github/workflows/test-v2.yml'
+      - '.tmp-v2/READY'
+
+permissions:
+  contents: write
+
+jobs:
+  test-v2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Assemble staged V2.4 when READY exists
+        id: staged
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -f .tmp-v2/READY ]]; then
+            cat .tmp-v2/part-* > VERSION-2-WITH-PANEL/setup-node-panel.sh
+            chmod +x VERSION-2-WITH-PANEL/setup-node-panel.sh
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+            echo "Assembled staged V2: $(wc -l < VERSION-2-WITH-PANEL/setup-node-panel.sh) lines"
+            sha256sum VERSION-2-WITH-PANEL/setup-node-panel.sh
+          else
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bash syntax
+        run: bash -n VERSION-2-WITH-PANEL/setup-node-panel.sh
+
+      - name: Built-in self-test
+        run: bash VERSION-2-WITH-PANEL/setup-node-panel.sh --self-test
+
+      - name: Pull real Remnawave Node image
+        if: steps.staged.outputs.enabled == 'true'
+        run: |
+          docker pull remnawave/node:latest
+          docker run --rm --entrypoint rw-core remnawave/node:latest version
+          docker run --rm --entrypoint rw-core remnawave/node:latest x25519 | tee /tmp/x25519.txt
+
+      - name: Prepare real X25519 values and TLS cert
+        if: steps.staged.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PRIV="$(awk -F': ' 'tolower($1) ~ /privatekey|private key/ {print $2; exit}' /tmp/x25519.txt)"
+          PUB="$(awk -F': ' 'tolower($1) ~ /password|publickey|public key/ {print $2; exit}' /tmp/x25519.txt)"
+          test -n "$PRIV"
+          test -n "$PUB"
+          echo "CI_PRIVATE_KEY=$PRIV" >> "$GITHUB_ENV"
+          echo "CI_PUBLIC_KEY=$PUB" >> "$GITHUB_ENV"
+          mkdir -p /tmp/hysteria/certs /tmp/v2
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -keyout /tmp/hysteria/certs/privkey.pem \
+            -out /tmp/hysteria/certs/fullchain.pem \
+            -subj '/CN=node.example.com' >/dev/null 2>&1
+
+      - name: Generate all 7 transport profiles
+        if: steps.staged.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for mode in 1 2 3 4 5 6 7; do
+            echo "=== BUILD MODE $mode ==="
+            HYSTERIA_CERT=/opt/hysteria/certs/fullchain.pem \
+            HYSTERIA_KEY=/opt/hysteria/certs/privkey.pem \
+            CI_PRIVATE_KEY="$CI_PRIVATE_KEY" CI_PUBLIC_KEY="$CI_PUBLIC_KEY" \
+              bash VERSION-2-WITH-PANEL/setup-node-panel.sh --ci-build "$mode" "/tmp/v2/m${mode}.json"
+            python3 -m json.tool "/tmp/v2/m${mode}.json" >/dev/null
+          done
+
+      - name: Assert generated profile semantics
+        if: steps.staged.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json
+          expected = {
+              1: [('tcp',443)],
+              2: [('hysteria',443)],
+              3: [('tcp',443),('hysteria',443)],
+              4: [('xhttp',443)],
+              5: [('tcp',443),('xhttp',8443)],
+              6: [('hysteria',443),('xhttp',443)],
+              7: [('tcp',443),('hysteria',443),('xhttp',8443)],
+          }
+          for mode, want in expected.items():
+              p=json.load(open(f'/tmp/v2/m{mode}.json'))
+              got=[]
+              for ib in p['inbounds']:
+                  ss=ib['streamSettings']
+                  net=ss['network']
+                  got.append((net,ib['port']))
+                  if net=='tcp':
+                      assert ib['protocol']=='vless'
+                      assert ss['security']=='reality'
+                      assert ss['realitySettings']['dest']=='ads.x5.ru:443'
+                      assert ss['realitySettings']['serverNames']==['ads.x5.ru']
+                      assert ss['sockopt']['mark']==255
+                      assert ss['sockopt']['tcpNoDelay'] is True
+                      assert ss['sockopt']['tcpFastOpen'] is True
+                      assert 'flow' not in ib['settings']
+                  elif net=='hysteria':
+                      assert ib['protocol']=='hysteria'
+                      assert ss['security']=='tls'
+                      assert ss['tlsSettings']['alpn']==['h3']
+                      assert ib['port']==443
+                  elif net=='xhttp':
+                      assert ib['protocol']=='vless'
+                      assert ss['security']=='reality'
+                      assert ss['realitySettings']['dest']=='ads.x5.ru:443'
+                      xs=ss['xhttpSettings']
+                      assert xs['mode']=='packet-up'
+                      assert xs['host']=='ads.x5.ru'
+                      assert xs['path'].startswith('/api/v1/') and xs['path'].endswith('/')
+                      assert 'extra' not in xs
+                      assert 'flow' not in ib['settings']
+                  else:
+                      raise AssertionError((mode, net))
+              assert sorted(got)==sorted(want), (mode,got,want)
+              assert p['dns']['queryStrategy']=='UseIPv4'
+              assert p['routing']['domainStrategy']=='IPIfNonMatch'
+              assert p['routing']['rules']==[{'type':'field','protocol':['bittorrent'],'outboundTag':'BLOCK'}]
+          print('All mode assertions: OK')
+          PY
+
+      - name: Validate every profile using real rw-core
+        if: steps.staged.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for mode in 1 2 3 4 5 6 7; do
+            echo "=== RW-CORE TEST MODE $mode ==="
+            docker run --rm \
+              --entrypoint rw-core \
+              -v "/tmp/v2/m${mode}.json:/tmp/profile.json:ro" \
+              -v "/tmp/hysteria/certs:/opt/hysteria/certs:ro" \
+              remnawave/node:latest run -test -c /tmp/profile.json
+          done
+
+      - name: Safety static assertions
+        if: steps.staged.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          FILE=VERSION-2-WITH-PANEL/setup-node-panel.sh
+          ! grep -Eq 'api_(delete|put)|_api[[:space:]]+(DELETE|PUT)' "$FILE"
+          grep -F 'Snapshot панели' "$FILE" >/dev/null
+          grep -F 'profile-modification' "$FILE" >/dev/null
+          grep -F 'rollback_node_binding' "$FILE" >/dev/null
+          grep -F 'CREATED_HOST_UUIDS' "$FILE" >/dev/null
+          grep -F 'after>=before' "$FILE" >/dev/null
+          echo 'Safety static assertions: OK'
+
+      - name: Verify staged SHA256
+        if: steps.staged.outputs.enabled == 'true'
+        run: |
+          EXPECTED='9dff6539f9fff121c4f546dbb805d9ac24f7f572032faebf33ea015c1ed7f08e'
+          ACTUAL="$(sha256sum VERSION-2-WITH-PANEL/setup-node-panel.sh | awk '{print $1}')"
+          echo "Expected: $EXPECTED"
+          echo "Actual:   $ACTUAL"
+          test "$EXPECTED" = "$ACTUAL"
+
+      - name: Promote tested staged V2.4 and remove staging parts
+        if: steps.staged.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf .tmp-v2
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add VERSION-2-WITH-PANEL/setup-node-panel.sh .tmp-v2
+          git diff --cached --check
+          git commit -m 'Promote tested V2.4 end-to-end installer'
+          git push origin HEAD:main
+
+      - name: Summary
+        if: always()
+        run: |
+          echo 'V2 test finished.'
+          echo "staged=${{ steps.staged.outputs.enabled }}"
+          if [[ -f VERSION-2-WITH-PANEL/setup-node-panel.sh ]]; then
+            sha256sum VERSION-2-WITH-PANEL/setup-node-panel.sh
+          fi
