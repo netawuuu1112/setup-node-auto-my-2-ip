@@ -1,0 +1,170 @@
+api_patch_squad(){ _api PATCH internal-squads "$1"; }
+api_patch_owned_host(){
+  local uuid="$1" body="$2"
+  jq -e --arg u "$uuid" 'index($u)!=null' <<<"$CREATED_HOST_UUIDS" >/dev/null || die "Safety: запрещён PATCH Host $uuid — он не создан текущим запуском"
+  _api PATCH hosts "$body"
+}
+
+panel_auth(){
+  local raw
+  if [[ -z "$PANEL_URL" ]]; then
+    read -r -p "Ссылка панели: " raw
+    normalize_panel_url "$raw"
+  else
+    raw="$PANEL_URL"
+    normalize_panel_url "$raw"
+  fi
+  local status
+  status="$(_api GET auth/status 2>/dev/null || true)"
+  if [[ -z "$status" ]]; then
+    warn "Панель не ответила. Если используется cookie-защита eGames, вставь полную ссылку входа с ?COOKIE=VALUE."
+    read -r -p "Полная ссылка панели [Enter=отмена]: " raw
+    [[ -n "$raw" ]] || die "Панель не отвечает: $PANEL_URL"
+    normalize_panel_url "$raw"
+    status="$(_api GET auth/status 2>/dev/null || true)"
+  fi
+  [[ -n "$status" ]] || die "Панель не отвечает: $PANEL_URL"
+  if [[ -n "$PANEL_TOKEN" ]]; then
+    api_get config-profiles >/dev/null || die "REMNAWAVE_TOKEN недействителен"
+    AUTH_MODE="token"; ok "Доступ к панели по API token"
+    return 0
+  fi
+  echo "Доступ к панели:"
+  echo "  1) Логин + пароль (пароль и JWT на диск не сохраняются)"
+  echo "  2) API token"
+  local ch; read -r -p "Выбор [${AUTH_MODE/login/1}]: " ch; ch="${ch:-$([[ "$AUTH_MODE" == token ]] && echo 2 || echo 1)}"
+  if [[ "$ch" == "2" ]]; then
+    AUTH_MODE="token"
+    read -r -s -p "API token: " PANEL_TOKEN; echo
+    [[ -n "$PANEL_TOKEN" ]] || die "Пустой token"
+  else
+    AUTH_MODE="login"
+    local user pass body resp
+    read -r -p "Логин панели: " user
+    read -r -s -p "Пароль панели: " pass; echo
+    body="$(jq -n --arg u "$user" --arg p "$pass" '{username:$u,password:$p}')"
+    resp="$(_api POST auth/login "$body" || true)"; unset pass
+    PANEL_TOKEN="$(jq -r '.response.accessToken // .accessToken // empty' <<<"$resp" 2>/dev/null || true)"
+    if [[ -z "$PANEL_TOKEN" ]]; then
+      warn "Вход логин/пароль не удался (возможен OAuth/Passkey-only режим)."
+      read -r -s -p "Введи API token панели: " PANEL_TOKEN; echo
+      AUTH_MODE="token"
+    fi
+  fi
+  api_get config-profiles >/dev/null || die "Авторизация панели не прошла"
+  ok "Панель авторизована"
+}
+
+ask_domain(){
+  [[ -n "$DOMAIN" ]] || read -r -p "Домен этой ноды: " DOMAIN
+  DOMAIN="${DOMAIN,,}"; DOMAIN="${DOMAIN%.}"
+  [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ && "$DOMAIN" == *.* ]] || die "Некорректный домен: $DOMAIN"
+}
+
+public_ipv4s(){
+  { ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1; curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true; } | sed '/^$/d' | sort -u
+}
+resolve4(){ getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u; }
+
+check_domain_strict(){
+  local dns ips x found=0
+  dns="$(resolve4 "$DOMAIN")"; ips="$(public_ipv4s)"
+  [[ -n "$dns" ]] || die "Домен $DOMAIN не имеет IPv4 A-записи"
+  info "DNS $DOMAIN -> $(tr '\n' ' ' <<<"$dns")"
+  info "IPv4 сервера -> $(tr '\n' ' ' <<<"$ips")"
+  while read -r x; do grep -Fxq "$x" <<<"$ips" && found=1; done <<<"$dns"
+  ((found)) || die "A-запись $DOMAIN не указывает на этот сервер. Исправь DNS и повтори."
+  ok "DNS домена соответствует серверу"
+}
+
+check_reality_target(){
+  (has_tcp || has_xhttp) || return 0
+  local out
+  out="$(timeout 8 openssl s_client -connect "$REALITY_TARGET:443" -servername "$REALITY_TARGET" </dev/null 2>/dev/null | head -n 2 || true)"
+  [[ -n "$out" ]] || die "Reality target $REALITY_TARGET:443 не проходит TLS-проверку"
+  ok "Reality target $REALITY_TARGET:443 доступен по TLS"
+}
+
+container_exists(){ docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER"; }
+container_running(){ docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER"; }
+existing_compose_dir(){
+  if container_exists; then docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$CONTAINER" 2>/dev/null || true; fi
+}
+existing_compose_service(){
+  if container_exists; then docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$CONTAINER" 2>/dev/null || true; fi
+}
+existing_compose_config_files(){
+  if container_exists; then docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$CONTAINER" 2>/dev/null || true; fi
+}
+detect_base_compose(){
+  local f
+  BASE_COMPOSE_FILE=""
+  for f in "$COMPOSE_DIR/docker-compose.yml" "$COMPOSE_DIR/docker-compose.yaml" "$COMPOSE_DIR/compose.yml" "$COMPOSE_DIR/compose.yaml"; do
+    [[ -f "$f" ]] && { BASE_COMPOSE_FILE="$f"; break; }
+  done
+  [[ -n "$BASE_COMPOSE_FILE" ]] || return 1
+  KOSMO_OVERRIDE_FILE="$COMPOSE_DIR/docker-compose.kosmo.yml"
+}
+build_existing_compose_args(){
+  COMPOSE_ARGS=()
+  local label f seen="," raw
+  label="$(existing_compose_config_files)"
+  if [[ -n "$label" ]]; then
+    IFS=',' read -ra raw <<<"$label"
+    for f in "${raw[@]}"; do
+      f="$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' <<<"$f")"
+      [[ -f "$f" ]] || continue
+      [[ "$seen" == *",$f,"* ]] && continue
+      COMPOSE_ARGS+=(-f "$f"); seen+="$f,"
+    done
+  fi
+  if ((${#COMPOSE_ARGS[@]}==0)); then
+    detect_base_compose || return 1
+    COMPOSE_ARGS=(-f "$BASE_COMPOSE_FILE"); seen+= "$BASE_COMPOSE_FILE,"
+    for f in "$COMPOSE_DIR/docker-compose.override.yml" "$COMPOSE_DIR/docker-compose.override.yaml" "$COMPOSE_DIR/compose.override.yml" "$COMPOSE_DIR/compose.override.yaml"; do
+      [[ -f "$f" ]] || continue
+      [[ "$seen" == *",$f,"* ]] && continue
+      COMPOSE_ARGS+=(-f "$f"); seen+="$f,"
+    done
+  else
+    BASE_COMPOSE_FILE="${COMPOSE_ARGS[1]}"
+    KOSMO_OVERRIDE_FILE="$COMPOSE_DIR/docker-compose.kosmo.yml"
+  fi
+  if [[ -n "$KOSMO_OVERRIDE_FILE" && -f "$KOSMO_OVERRIDE_FILE" && "$seen" != *",$KOSMO_OVERRIDE_FILE,"* ]]; then
+    COMPOSE_ARGS+=(-f "$KOSMO_OVERRIDE_FILE")
+  fi
+}
+
+choose_install_mode(){
+  if container_exists || [[ -f "$COMPOSE_DIR/docker-compose.yml" ]] || [[ -f "$COMPOSE_DIR/docker-compose.yaml" ]] || [[ -f "$COMPOSE_DIR/compose.yml" ]] || [[ -f "$COMPOSE_DIR/compose.yaml" ]]; then
+    INSTALL_MODE="existing"
+    local d img svc
+    d="$(existing_compose_dir)"; [[ -n "$d" && -d "$d" ]] && COMPOSE_DIR="$d"
+    detect_base_compose || die "Существующая RemnaNode найдена, но compose-файл не обнаружен в $COMPOSE_DIR"
+    if container_exists; then
+      img="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
+      [[ -n "$img" ]] && REMNANODE_IMAGE="$img"
+      svc="$(existing_compose_service)"; [[ -n "$svc" ]] && COMPOSE_SERVICE="$svc"
+    fi
+    if [[ -z "${svc:-}" ]]; then
+      local services count
+      services="$(docker compose -f "$BASE_COMPOSE_FILE" config --services 2>/dev/null || true)"
+      count="$(sed '/^$/d' <<<"$services" | wc -l)"
+      [[ "$count" == 1 ]] && COMPOSE_SERVICE="$(sed '/^$/d' <<<"$services")"
+    fi
+    ok "Обнаружена существующая RemnaNode — base compose не перезаписывается (dir=$COMPOSE_DIR, service=$COMPOSE_SERVICE, image=$REMNANODE_IMAGE)"
+  else
+    INSTALL_MODE="new"; BASE_COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"; KOSMO_OVERRIDE_FILE=""; info "RemnaNode не найдена — режим новой установки"
+  fi
+}
+
+mode_desc(){
+  case "$1" in
+    1) echo "VLESS TCP Reality";;
+    2) echo "Hysteria2";;
+    3) echo "VLESS TCP Reality + Hysteria2";;
+    4) echo "VLESS XHTTP Reality";;
+    5) echo "VLESS TCP Reality + XHTTP Reality";;
+    6) echo "Hysteria2 + XHTTP Reality";;
+    7) echo "TCP Reality + Hysteria2 + XHTTP Reality";;
+    *) return 1;;
