@@ -1,39 +1,62 @@
-# VERSION 2 — WITH PANEL (SAFE SINGLE FILE)
+# VERSION 2 — WITH PANEL / INTERACTIVE SAFE
 
-В этой папке используется один исполняемый файл:
+В папке один рабочий исполняемый скрипт:
 
-`setup-node-panel-safe.py`
+`setup-node-panel.sh`
 
-Это безопасная тестовая версия с подключением к Remnawave Panel API без внешних Python-зависимостей: используется только стандартная библиотека Python.
-
-Основные команды:
+Запуск:
 
 ```bash
-chmod +x setup-node-panel-safe.py
-./setup-node-panel-safe.py self-test
-./setup-node-panel-safe.py plan --domain node.example.com
-./setup-node-panel-safe.py execute --domain node.example.com --confirm CREATE-ONLY
-./setup-node-panel-safe.py doctor --reality-tag REALITY-TCP-TEST --hysteria-tag HYSTERIA-BBR-TEST
+chmod +x setup-node-panel.sh
+./setup-node-panel.sh
 ```
 
-Перед `plan`/`execute`:
+Без аргументов открывается меню. Для обычного запуска достаточно в первый раз указать только:
 
-```bash
-export REMNAWAVE_BASE_URL='https://panel.example.com'
-export REMNAWAVE_TOKEN='API_TOKEN'
-```
+- URL панели Remnawave;
+- API token;
+- домен ноды.
 
-Безопасность v2:
+Остальное зашито по проверенной схеме:
 
-- `plan` только читает панель и ничего не изменяет;
-- `execute` разрешён только после предварительного `plan`;
-- перед созданием объектов сохраняется локальный snapshot состояния панели;
-- существующие Profile / Host / Internal Squad не обновляются;
-- при совпадении имён скрипт останавливается;
-- DELETE и PATCH в скрипте запрещены;
+- Hysteria — UDP/443;
+- VLESS TCP Reality — TCP/443;
+- Reality target/SNI — `ads.x5.ru`;
+- fingerprint — `chrome`;
+- `network: tcp`;
+- `sockopt.mark: 255`;
+- `tcpNoDelay: true`;
+- `tcpFastOpen: true`;
+- Remnawave автоматически добавляет `xtls-rprx-vision`;
+- SelfSteal не используется.
+
+Меню:
+
+1. Быстрая безопасная настройка.
+2. Проверка + PLAN без изменений панели.
+3. Диагностика RemnaNode / effective config.
+4. Расширенные настройки.
+5. Просмотр state созданных объектов.
+6. Self-test.
+
+Безопасность:
+
+- скрипт работает в режиме CREATE-ONLY;
+- существующие Profile, Host, Internal Squad и inbound не обновляются;
+- при совпадении имени/tag выполнение останавливается;
+- перед записью сохраняется snapshot панели;
+- DELETE/PATCH существующих объектов не выполняются;
+- API token не сохраняется на диск;
 - рабочая Node автоматически не переключается;
-- автоматического удаления при ошибке нет;
-- по умолчанию разрешены только TEST-имена;
-- конфигурация: Hysteria UDP/443 + VLESS TCP Reality TCP/443, `ads.x5.ru`, без SelfSteal.
+- при ошибке уже созданные объекты автоматически не удаляются.
 
-Версия 1 в соседней папке остаётся полностью отдельной и не подключается к панели.
+CLI также поддерживает:
+
+```bash
+./setup-node-panel.sh --plan
+./setup-node-panel.sh --quick
+./setup-node-panel.sh --doctor
+./setup-node-panel.sh --self-test
+```
+
+Версия 1 в соседней папке остаётся независимой и не подключается к панели.
