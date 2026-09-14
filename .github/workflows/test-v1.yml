@@ -1,0 +1,148 @@
+name: Test V1 on real Remnawave image
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'VERSION-1-NO-PANEL/setup-node.sh'
+      - '.github/workflows/test-v1.yml'
+
+jobs:
+  test-v1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n VERSION-1-NO-PANEL/setup-node.sh
+
+      - name: Start real Remnawave Node image for rw-core tests
+        run: |
+          docker pull remnawave/node:latest
+          docker run -d --name remnanode --entrypoint sh remnawave/node:latest -c 'sleep 900'
+          docker exec remnanode sh -c 'mkdir -p /opt/hysteria/certs && : > /opt/hysteria/certs/fullchain.pem && : > /opt/hysteria/certs/privkey.pem'
+          docker exec remnanode rw-core version
+          docker exec remnanode rw-core x25519
+
+      - name: Live check Reality target
+        continue-on-error: true
+        run: timeout 8 bash -c '</dev/tcp/ads.x5.ru/443' && echo 'ads.x5.ru:443 reachable'
+
+      - name: Generate profile using real rw-core x25519
+        env:
+          STATE: ${{ runner.temp }}/v1-state.env
+          OUTPUT: ${{ runner.temp }}/v1-profile.json
+        run: |
+          chmod +x VERSION-1-NO-PANEL/setup-node.sh
+          VERSION-1-NO-PANEL/setup-node.sh generate --domain example.com --yes --output "$OUTPUT"
+          test -s "$OUTPUT"
+          test -s "$STATE"
+          python3 -m json.tool "$OUTPUT" >/dev/null
+
+      - name: Validate generated profile fields
+        env:
+          STATE: ${{ runner.temp }}/v1-state.env
+          OUTPUT: ${{ runner.temp }}/v1-profile.json
+        run: |
+          python3 - <<'PY'
+          import json, os
+          p=json.load(open(os.environ['OUTPUT']))
+          assert p['dns']['queryStrategy']=='UseIPv4'
+          ib={x['tag']:x for x in p['inbounds']}
+          h=ib['HYSTERIA-BBR']
+          r=ib['REALITY-TCP']
+          assert h['port']==443 and h['protocol']=='hysteria'
+          assert h['streamSettings']['network']=='hysteria'
+          assert r['port']==443 and r['protocol']=='vless'
+          assert r['streamSettings']['network']=='tcp'
+          assert r['streamSettings']['security']=='reality'
+          assert r['streamSettings']['sockopt']['mark']==255
+          rs=r['streamSettings']['realitySettings']
+          assert rs['dest']=='ads.x5.ru:443'
+          assert rs['serverNames']==['ads.x5.ru']
+          assert len(rs['shortIds'][0])==16
+          assert rs['privateKey']
+          assert 'flow' not in r['settings']
+          assert p['routing']['rules']==[{'type':'field','protocol':['bittorrent'],'outboundTag':'BLOCK'}]
+          print('Generated profile assertions: OK')
+          PY
+
+      - name: Test show-config and show-host
+        env:
+          STATE: ${{ runner.temp }}/v1-state.env
+          OUTPUT: ${{ runner.temp }}/v1-profile.json
+        run: |
+          VERSION-1-NO-PANEL/setup-node.sh show-config | python3 -m json.tool >/dev/null
+          VERSION-1-NO-PANEL/setup-node.sh show-host | tee /tmp/show-host.txt
+          grep -F 'Address: example.com' /tmp/show-host.txt
+          grep -F 'SNI: ads.x5.ru' /tmp/show-host.txt
+          grep -F 'Expected flow: xtls-rprx-vision' /tmp/show-host.txt
+
+      - name: Replace only container cli with deterministic effective-config stub
+        run: |
+          cat > /tmp/cli <<'EOF'
+          #!/bin/sh
+          if [ "$1" = "--dump-config-raw" ]; then
+          cat <<'JSON'
+          {
+            "inbounds": [
+              {
+                "tag": "HYSTERIA-BBR",
+                "protocol": "hysteria",
+                "settings": {"clients": []},
+                "streamSettings": {"network": "hysteria", "security": "tls"}
+              },
+              {
+                "tag": "REALITY-TCP",
+                "protocol": "vless",
+                "settings": {"clients": [{"id":"test"}], "flow": "xtls-rprx-vision"},
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "reality",
+                  "realitySettings": {"dest": "ads.x5.ru:443"}
+                }
+              }
+            ]
+          }
+          JSON
+          exit 0
+          fi
+          exit 1
+          EOF
+          chmod +x /tmp/cli
+          docker cp /tmp/cli remnanode:/usr/local/bin/cli
+
+      - name: Run doctor against real Docker + real rw-core + stub effective config
+        env:
+          STATE: ${{ runner.temp }}/v1-state.env
+          OUTPUT: ${{ runner.temp }}/v1-profile.json
+        run: |
+          VERSION-1-NO-PANEL/setup-node.sh doctor | tee /tmp/doctor.txt
+          grep -F '[OK] HYSTERIA-BBR' /tmp/doctor.txt
+          grep -F '[OK] REALITY-TCP' /tmp/doctor.txt
+          grep -F 'network= tcp' /tmp/doctor.txt
+          grep -F 'security= reality' /tmp/doctor.txt
+          grep -F 'flow= xtls-rprx-vision' /tmp/doctor.txt
+          grep -F 'dest= ads.x5.ru:443' /tmp/doctor.txt
+
+      - name: Negative test - missing container must fail
+        env:
+          STATE: ${{ runner.temp }}/v1-state.env
+          OUTPUT: ${{ runner.temp }}/v1-profile.json
+          CONTAINER: container-that-does-not-exist
+        run: |
+          set +e
+          VERSION-1-NO-PANEL/setup-node.sh generate --domain example.com --yes --output "$OUTPUT.bad" >/tmp/negative.out 2>&1
+          rc=$?
+          set -e
+          cat /tmp/negative.out
+          test "$rc" -ne 0
+          grep -F 'не запущен' /tmp/negative.out
+
+      - name: Report
+        if: always()
+        run: |
+          echo 'V1 integration test completed on GitHub-hosted Ubuntu runner.'
+          docker ps -a || true
